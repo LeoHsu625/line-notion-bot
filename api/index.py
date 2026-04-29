@@ -20,6 +20,14 @@ anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 TW_TZ = timezone(timedelta(hours=8))
 
 
+def get_logical_date() -> str:
+    """凌晨 6 點前仍視為前一天"""
+    now = datetime.now(TW_TZ)
+    if now.hour < 6:
+        now = now - timedelta(days=1)
+    return now.strftime('%Y-%m-%d')
+
+
 def verify_line_signature(body: bytes, signature: str) -> bool:
     h = hmac.new(LINE_CHANNEL_SECRET.encode('utf-8'), body, hashlib.sha256).digest()
     expected = base64.b64encode(h).decode('utf-8')
@@ -27,7 +35,7 @@ def verify_line_signature(body: bytes, signature: str) -> bool:
 
 
 def get_today_tasks() -> list:
-    today = datetime.now(TW_TZ).strftime('%Y-%m-%d')
+    today = get_logical_date()
     url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -63,7 +71,7 @@ def mark_task_done(task_id: str) -> bool:
 
 
 def add_task(name: str, date: str = None) -> bool:
-    task_date = date or datetime.now(TW_TZ).strftime('%Y-%m-%d')
+    task_date = date or get_logical_date()
     url = "https://api.notion.com/v1/pages"
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -82,7 +90,7 @@ def add_task(name: str, date: str = None) -> bool:
 
 
 def ask_claude(user_message: str, tasks: list) -> dict:
-    today = datetime.now(TW_TZ).strftime('%Y-%m-%d')
+    today = get_logical_date()
     if tasks:
         task_list_str = "\n".join([f"- [ID:{t['id']}] {t['name']}" for t in tasks])
     else:
