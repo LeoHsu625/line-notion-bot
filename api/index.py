@@ -15,6 +15,8 @@ LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '')
 NOTION_TOKEN = os.environ.get('NOTION_TOKEN', '')
 NOTION_DATABASE_ID = os.environ.get('NOTION_DATABASE_ID', '')
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
+LINE_USER_ID = os.environ.get('LINE_USER_ID', '')
+CRON_SECRET = os.environ.get('CRON_SECRET', '')
 
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 TW_TZ = timezone(timedelta(hours=8))
@@ -138,6 +140,18 @@ def reply_to_line(reply_token: str, message: str):
     )
 
 
+def push_to_line(user_id: str, message: str):
+    httpx.post(
+        "https://api.line.me/v2/bot/message/push",
+        headers={
+            "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json={"to": user_id, "messages": [{"type": "text", "text": message}]},
+        timeout=10,
+    )
+
+
 @app.route('/api/webhook', methods=['POST'])
 def webhook():
     signature = request.headers.get('X-Line-Signature', '')
@@ -150,8 +164,14 @@ def webhook():
         if event.get('type') != 'message' or event['message'].get('type') != 'text':
             continue
 
-        user_message = event['message']['text']
+        user_message = event['message']['text'].strip()
         reply_token = event['replyToken']
+
+        # 特殊指令：取得自己的 User ID
+        if user_message == '/myid':
+            user_id = event.get('source', {}).get('userId', '找不到')
+            reply_to_line(reply_token, f"你的 LINE User ID 是：\n{user_id}")
+            continue
 
         try:
             tasks = get_today_tasks()
@@ -175,6 +195,29 @@ def webhook():
         reply_to_line(reply_token, reply_text)
 
     return jsonify({'status': 'ok'})
+
+
+@app.route('/api/cron', methods=['GET'])
+def cron():
+    # 驗證是 Vercel 發出的排程請求
+    auth = request.headers.get('Authorization', '')
+    if CRON_SECRET and auth != f'Bearer {CRON_SECRET}':
+        abort(401)
+
+    if not LINE_USER_ID:
+        return jsonify({'error': 'LINE_USER_ID not set'}), 400
+
+    tasks = get_today_tasks()
+    today = get_logical_date()
+
+    if not tasks:
+        message = f"早安！☀️\n{today} 今天沒有待辦事項，有需要新增嗎？"
+    else:
+        task_lines = "\n".join([f"• {t['name']}" for t in tasks])
+        message = f"早安！☀️ 今天有 {len(tasks)} 件待辦：\n\n{task_lines}\n\n有需要調整的嗎？"
+
+    push_to_line(LINE_USER_ID, message)
+    return jsonify({'status': 'ok', 'tasks_count': len(tasks)})
 
 
 @app.route('/', methods=['GET'])
