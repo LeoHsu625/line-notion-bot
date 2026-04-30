@@ -61,6 +61,29 @@ def get_today_tasks() -> list:
     return tasks
 
 
+def get_tasks_for_date(date: str) -> dict:
+    """回傳指定日期的所有任務，分為 done / not_done 兩組"""
+    url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
+    }
+    payload = {"filter": {"property": "Date", "date": {"equals": date}}}
+    resp = httpx.post(url, headers=headers, json=payload, timeout=10)
+    done, not_done = [], []
+    for result in resp.json().get('results', []):
+        title = result['properties']['Name']['title']
+        if not title:
+            continue
+        name = title[0]['plain_text']
+        if result['properties']['Status']['checkbox']:
+            done.append(name)
+        else:
+            not_done.append(name)
+    return {'done': done, 'not_done': not_done}
+
+
 def mark_task_done(task_id: str) -> bool:
     url = f"https://api.notion.com/v1/pages/{task_id}"
     headers = {
@@ -218,6 +241,43 @@ def cron():
 
     push_to_line(LINE_USER_ID, message)
     return jsonify({'status': 'ok', 'tasks_count': len(tasks)})
+
+
+@app.route('/api/night', methods=['GET'])
+def night_cron():
+    auth = request.headers.get('Authorization', '')
+    if CRON_SECRET and auth != f'Bearer {CRON_SECRET}':
+        abort(401)
+
+    if not LINE_USER_ID:
+        return jsonify({'error': 'LINE_USER_ID not set'}), 400
+
+    today = get_logical_date()
+    tomorrow = (datetime.strptime(today, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+
+    today_tasks = get_tasks_for_date(today)
+    done_count = len(today_tasks['done'])
+    total_count = done_count + len(today_tasks['not_done'])
+
+    if total_count > 0:
+        pct = int(done_count / total_count * 100)
+        today_line = f"今日完成率：{done_count}/{total_count}（{pct}%）"
+        if today_tasks['not_done']:
+            undone = "\n".join([f"  ❌ {t}" for t in today_tasks['not_done']])
+            today_line += f"\n未完成：\n{undone}"
+    else:
+        today_line = "今日沒有任務紀錄（可能還沒跑 /morning）"
+
+    tomorrow_tasks = get_tasks_for_date(tomorrow)
+    if tomorrow_tasks['not_done']:
+        lines = "\n".join([f"• {t}" for t in tomorrow_tasks['not_done']])
+        tomorrow_section = f"明日預覽（{len(tomorrow_tasks['not_done'])} 件）：\n{lines}"
+    else:
+        tomorrow_section = "明天還沒有任務規劃，記得安排一下！"
+
+    message = f"晚安！🌙 今天辛苦了。\n\n{today_line}\n\n{tomorrow_section}"
+    push_to_line(LINE_USER_ID, message)
+    return jsonify({'status': 'ok', 'today_total': total_count, 'today_done': done_count, 'tomorrow_count': len(tomorrow_tasks['not_done'])})
 
 
 @app.route('/', methods=['GET'])
