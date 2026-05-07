@@ -167,11 +167,13 @@ def ask_groq(user_message: str, tasks: list) -> dict:
 根據用戶訊息判斷意圖，只回傳 JSON，格式如下：
 - 查詢任務：{{"action":"query_tasks","reply":"整理好的任務清單"}}
 - 標記完成：{{"action":"mark_done","row":<列號數字>,"reply":"確認完成的回覆"}}
-- 新增任務：{{"action":"add_task","task_name":"任務名稱","date":null或"YYYY-MM-DD","reply":"確認新增的回覆"}}
+- 新增單筆任務：{{"action":"add_task","task_name":"任務名稱","date":null或"YYYY-MM-DD","reply":"確認新增的回覆"}}
+- 新增多筆任務：{{"action":"add_tasks","tasks":[{{"task_name":"任務1","date":null}},{{"task_name":"任務2","date":"YYYY-MM-DD"}}],"reply":"確認新增N筆任務的回覆"}}
 - 其他：{{"action":"reply","reply":"友善回覆"}}
 
 規則：
 - 全部用繁體中文回覆
+- 用戶一次提到多個任務時，使用 add_tasks
 - 標記完成時，從清單找最相符的任務並填入 ROW 數字
 - 找不到對應任務時用 action: reply 告知"""
 
@@ -239,12 +241,12 @@ def webhook():
             if result == 'registered':
                 active = len(get_active_user_ids())
                 reply_to_line(reply_token,
-                    f'歡迎加入 AI 任務助理 Beta！🎉\n\n'
-                    f'你是第 {active} 位成員，名額還剩 {MAX_USERS - active} 個。\n\n'
-                    f'現在試著說：\n'
-                    f'・「今天有什麼事？」\n'
-                    f'・「幫我新增任務：讀一篇文章」\n'
-                    f'・「週報做完了」')
+                    f'嗨！我是 Aria，你的 AI 待辦助理 👋\n\n'
+                    f'你是第 {active} 位 Beta 成員，名額還剩 {MAX_USERS - active} 個。\n\n'
+                    f'你可以這樣跟我說：\n\n'
+                    f'📋 查詢任務\n「今天有什麼事？」\n\n'
+                    f'➕ 新增任務\n「幫我新增任務：讀一篇文章」\n「5/9 要記得繳費」（可指定日期）\n「新增任務：A、B、C」（可一次多筆）\n\n'
+                    f'✅ 標記完成\n「週報做完了」')
             else:
                 waitlist = get_waitlist_count()
                 reply_to_line(reply_token,
@@ -275,6 +277,11 @@ def webhook():
                 task_name = result.get('task_name', '')
                 if task_name and not add_task(task_name, user_id, result.get('date')):
                     reply_text = '新增失敗，請稍後再試 🙏'
+            elif action == 'add_tasks':
+                failed = [t['task_name'] for t in result.get('tasks', [])
+                          if t.get('task_name') and not add_task(t['task_name'], user_id, t.get('date'))]
+                if failed:
+                    reply_text = f'部分任務新增失敗：{", ".join(failed)} 🙏'
         except Exception:
             reply_text = '發生錯誤，請稍後再試 🙏'
 
