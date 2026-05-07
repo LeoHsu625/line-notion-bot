@@ -202,7 +202,8 @@ def ask_groq(user_message: str, tasks: list) -> dict:
 - 用戶詢問特定日期（非今天）時使用 query_date，date 填入該日期
 - 用戶一次提到多個任務時，使用 add_tasks
 - 標記完成時，從清單找最相符的任務並填入 ROW 數字
-- 找不到對應任務時用 action: reply 告知"""
+- 找不到對應任務時用 action: reply 告知
+- 如果用戶在任務中指定時間，請將時間保留在 task_name 中（例如：task_name 為「21:00 打匹克球」）"""
 
     resp = groq_client.chat.completions.create(
         model='llama-3.3-70b-versatile',
@@ -271,12 +272,16 @@ def webhook():
             if result == 'registered':
                 active = len(get_active_user_ids())
                 reply_to_line(reply_token,
-                    f'嗨！我是 Aria，你的 AI 待辦助理 👋\n\n'
-                    f'你是第 {active} 位 Beta 成員，名額還剩 {MAX_USERS - active} 個。\n\n'
-                    f'你可以這樣跟我說：\n\n'
-                    f'📋 查詢任務\n「今天有什麼事？」\n「5/9 有什麼事？」（可指定日期）\n\n'
-                    f'➕ 新增任務\n「幫我新增任務：讀一篇文章」\n「5/9 要記得繳費」（可指定日期）\n「新增任務：A、B、C」（可一次多筆）\n\n'
-                    f'✅ 標記完成\n「週報做完了」\n\n'
+                    f'嗨！我是 Aria 👋 你的 LINE 任務小幫手\n\n'
+                    f'你是第 {active} 位 Beta 成員，名額還剩 {MAX_USERS - active} 個 🎉\n\n'
+                    f'直接跟我說話就好，例如：\n\n'
+                    f'📋 「今天有什麼事？」\n'
+                    f'➕ 「幫我記：明天要繳費」\n'
+                    f'➕ 「5/9 21:00 打匹克球」（支援時間和日期）\n'
+                    f'✅ 「週報做完了」\n'
+                    f'🗑️ 「刪除：打匹克球」\n'
+                    f'📌 「我這週有什麼事？」\n\n'
+                    f'有什麼想記的，直接說就好 😊\n\n'
                     f'📌 使用須知：你的任務資料會儲存於管理者的 Google Sheet，僅供本服務使用。')
             else:
                 waitlist = get_waitlist_count()
@@ -300,7 +305,14 @@ def webhook():
             action = result.get('action')
             reply_text = result.get('reply', '收到！')
 
-            if action == 'query_upcoming':
+            if action == 'query_tasks':
+                if not tasks:
+                    reply_text = '今天沒有待辦事項 🎉'
+                else:
+                    lines = [f'📋 今天有 {len(tasks)} 件待辦：\n']
+                    lines += [f'・{t["name"]}' for t in tasks]
+                    reply_text = '\n'.join(lines)
+            elif action == 'query_upcoming':
                 upcoming = get_upcoming_tasks(user_id)
                 if not upcoming:
                     reply_text = '目前沒有任何未完成的任務安排 🎉'
@@ -348,9 +360,25 @@ def webhook():
                 if task_name and not add_task(task_name, user_id, result.get('date')):
                     reply_text = '新增失敗，請稍後再試 🙏'
             elif action == 'add_tasks':
-                failed = [t['task_name'] for t in result.get('tasks', [])
-                          if t.get('task_name') and not add_task(t['task_name'], user_id, t.get('date'))]
-                if failed:
+                succeeded = []
+                failed = []
+                for t in result.get('tasks', []):
+                    task_name = t.get('task_name', '')
+                    if not task_name:
+                        continue
+                    date_val = t.get('date')
+                    if add_task(task_name, user_id, date_val):
+                        label = f'{date_val} {task_name}' if date_val else task_name
+                        succeeded.append(label)
+                    else:
+                        failed.append(task_name)
+                if succeeded:
+                    lines = [f'✅ 新增了 {len(succeeded)} 個任務：']
+                    lines += [f'- {s}' for s in succeeded]
+                    if failed:
+                        lines.append(f'\n⚠️ 以下任務新增失敗：{", ".join(failed)} 🙏')
+                    reply_text = '\n'.join(lines)
+                elif failed:
                     reply_text = f'部分任務新增失敗：{", ".join(failed)} 🙏'
         except Exception:
             reply_text = '抱歉，剛才沒有反應過來 😅 可以再說一次，或換個方式試試？'
