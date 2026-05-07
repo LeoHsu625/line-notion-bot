@@ -19,6 +19,7 @@ CRON_SECRET               = os.environ.get('CRON_SECRET', '')
 GROQ_API_KEY              = os.environ.get('GROQ_API_KEY', '')
 SPREADSHEET_ID            = os.environ.get('SPREADSHEET_ID', '')
 SERVICE_ACCOUNT_JSON      = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '{}')
+ADMIN_USER_IDS            = set(os.environ.get('ADMIN_USER_IDS', '').split(',')) - {''}
 
 MAX_USERS = 10
 
@@ -235,8 +236,11 @@ def webhook():
             reply_to_line(reply_token, f'你的 LINE User ID：\n{user_id}')
             continue
 
-        # ── Registration check ──
-        status = get_user_status(user_id)
+        # ── Admin bypass ──
+        if user_id in ADMIN_USER_IDS:
+            status = 'active'
+        else:
+            status = get_user_status(user_id)
 
         if status == 'new':
             result = register_user(user_id)
