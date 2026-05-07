@@ -176,7 +176,7 @@ def ask_groq(user_message: str, tasks: list) -> dict:
 - 找不到對應任務時用 action: reply 告知"""
 
     resp = groq_client.chat.completions.create(
-        model='llama-3.1-8b-instant',
+        model='llama-3.3-70b-versatile',
         max_tokens=500,
         messages=[
             {'role': 'system', 'content': system_prompt},
