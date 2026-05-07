@@ -20,7 +20,7 @@ GROQ_API_KEY              = os.environ.get('GROQ_API_KEY', '')
 SPREADSHEET_ID            = os.environ.get('SPREADSHEET_ID', '')
 SERVICE_ACCOUNT_JSON      = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '{}')
 
-MAX_USERS = 20
+MAX_USERS = 10
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 TW_TZ = timezone(timedelta(hours=8))
@@ -248,7 +248,8 @@ def webhook():
                     f'你可以這樣跟我說：\n\n'
                     f'📋 查詢任務\n「今天有什麼事？」\n「5/9 有什麼事？」（可指定日期）\n\n'
                     f'➕ 新增任務\n「幫我新增任務：讀一篇文章」\n「5/9 要記得繳費」（可指定日期）\n「新增任務：A、B、C」（可一次多筆）\n\n'
-                    f'✅ 標記完成\n「週報做完了」')
+                    f'✅ 標記完成\n「週報做完了」\n\n'
+                    f'📌 使用須知：你的任務資料會儲存於管理者的 Google Sheet，僅供本服務使用。')
             else:
                 waitlist = get_waitlist_count()
                 reply_to_line(reply_token,
@@ -289,8 +290,13 @@ def webhook():
                         reply_text = f'📅 {date} 的任務：\n\n' + '\n'.join(lines)
             elif action == 'mark_done':
                 row = result.get('row')
-                if row and not mark_task_done(int(row)):
-                    reply_text = '標記失敗，請稍後再試 🙏'
+                if row:
+                    if mark_task_done(int(row)):
+                        task_name = next((t['name'] for t in tasks if t['row'] == int(row)), None)
+                        if task_name:
+                            reply_text = f'✅ 已完成：{task_name}\n\n如果標錯了，請告訴我！'
+                    else:
+                        reply_text = '標記失敗，請稍後再試 🙏'
             elif action == 'add_task':
                 task_name = result.get('task_name', '')
                 if task_name and not add_task(task_name, user_id, result.get('date')):
@@ -301,7 +307,7 @@ def webhook():
                 if failed:
                     reply_text = f'部分任務新增失敗：{", ".join(failed)} 🙏'
         except Exception:
-            reply_text = '發生錯誤，請稍後再試 🙏'
+            reply_text = '抱歉，剛才沒有反應過來 😅 可以再說一次，或換個方式試試？'
 
         reply_to_line(reply_token, reply_text)
 
