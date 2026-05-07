@@ -143,6 +143,14 @@ def mark_task_done(row_index: int) -> bool:
         return False
 
 
+def delete_task(row_index: int) -> bool:
+    try:
+        get_tasks_sheet().delete_rows(row_index)
+        return True
+    except Exception:
+        return False
+
+
 def add_task(name: str, user_id: str, date: str = None) -> bool:
     try:
         get_tasks_sheet().append_row([date or get_logical_date(), name, 'FALSE', user_id])
@@ -169,6 +177,7 @@ def ask_groq(user_message: str, tasks: list) -> dict:
 - 查詢今日任務：{{"action":"query_tasks","reply":"整理好的任務清單"}}
 - 查詢指定日期：{{"action":"query_date","date":"YYYY-MM-DD","reply":""}}
 - 標記完成：{{"action":"mark_done","row":<列號數字>,"reply":"確認完成的回覆"}}
+- 刪除任務：{{"action":"delete_task","row":<列號數字>,"reply":"確認刪除的回覆"}}
 - 新增單筆任務：{{"action":"add_task","task_name":"任務名稱","date":null或"YYYY-MM-DD","reply":"確認新增的回覆"}}
 - 新增多筆任務：{{"action":"add_tasks","tasks":[{{"task_name":"任務1","date":null}},{{"task_name":"任務2","date":"YYYY-MM-DD"}}],"reply":"確認新增N筆任務的回覆"}}
 - 其他：{{"action":"reply","reply":"友善回覆"}}
@@ -301,6 +310,14 @@ def webhook():
                             reply_text = f'✅ 已完成：{task_name}\n\n如果標錯了，請告訴我！'
                     else:
                         reply_text = '標記失敗，請稍後再試 🙏'
+            elif action == 'delete_task':
+                row = result.get('row')
+                if row:
+                    task_name = next((t['name'] for t in tasks if t['row'] == int(row)), None)
+                    if delete_task(int(row)):
+                        reply_text = f'🗑️ 已刪除：{task_name or "任務"}'
+                    else:
+                        reply_text = '刪除失敗，請稍後再試 🙏'
             elif action == 'add_task':
                 task_name = result.get('task_name', '')
                 if task_name and not add_task(task_name, user_id, result.get('date')):
