@@ -101,6 +101,20 @@ def get_today_tasks(user_id: str) -> list:
     return tasks
 
 
+def get_upcoming_tasks(user_id: str) -> dict:
+    """Return all undone tasks from today onwards, grouped by date."""
+    today = get_logical_date()
+    rows = get_tasks_sheet().get_all_records()
+    grouped = {}
+    for row in rows:
+        date = str(row.get('日期', ''))
+        if (date >= today
+                and str(row.get('user_id', '')) == user_id
+                and str(row.get('完成', '')).upper() != 'TRUE'):
+            grouped.setdefault(date, []).append(str(row.get('任務名稱', '')))
+    return dict(sorted(grouped.items()))
+
+
 def get_tasks_for_date(date: str, user_id: str) -> dict:
     rows = get_tasks_sheet().get_all_records()
     done, not_done = [], []
@@ -176,6 +190,7 @@ def ask_groq(user_message: str, tasks: list) -> dict:
 根據用戶訊息判斷意圖，只回傳 JSON，格式如下：
 - 查詢今日任務：{{"action":"query_tasks","reply":"整理好的任務清單"}}
 - 查詢指定日期：{{"action":"query_date","date":"YYYY-MM-DD","reply":""}}
+- 查詢所有未來任務：{{"action":"query_upcoming","reply":""}}
 - 標記完成：{{"action":"mark_done","row":<列號數字>,"reply":"確認完成的回覆"}}
 - 刪除任務：{{"action":"delete_task","row":<列號數字>,"reply":"確認刪除的回覆"}}
 - 新增單筆任務：{{"action":"add_task","task_name":"任務名稱","date":null或"YYYY-MM-DD","reply":"確認新增的回覆"}}
@@ -285,7 +300,17 @@ def webhook():
             action = result.get('action')
             reply_text = result.get('reply', '收到！')
 
-            if action == 'query_date':
+            if action == 'query_upcoming':
+                upcoming = get_upcoming_tasks(user_id)
+                if not upcoming:
+                    reply_text = '目前沒有任何未完成的任務安排 🎉'
+                else:
+                    lines = []
+                    for date, names in upcoming.items():
+                        lines.append(f'📅 {date}')
+                        lines += [f'  ・{n}' for n in names]
+                    reply_text = '📋 任務總覽：\n\n' + '\n'.join(lines)
+            elif action == 'query_date':
                 date = result.get('date', '')
                 if date:
                     dt = get_tasks_for_date(date, user_id)
