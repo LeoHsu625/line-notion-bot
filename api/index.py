@@ -566,16 +566,9 @@ def cron():
     if CRON_SECRET and auth != f'Bearer {CRON_SECRET}':
         abort(401)
 
-    today = get_logical_date()
-
-    try:
-        regular_ids = [uid for uid in get_active_user_ids() if uid not in ADMIN_USER_IDS]
-        all_tasks   = get_all_today_tasks_bulk(regular_ids) if regular_ids else {}
-    except Exception:
-        regular_ids = []
-        all_tasks   = {}
-
-    all_ids = list(ADMIN_USER_IDS) + regular_ids
+    today       = get_logical_date()
+    active_ids  = get_active_user_ids()
+    all_tasks   = get_all_today_tasks_bulk(active_ids)  # single sheet read
 
     def send_morning(uid):
         tasks = get_today_tasks_notion() if uid in ADMIN_USER_IDS else all_tasks.get(uid, [])
@@ -587,9 +580,9 @@ def cron():
         push_to_line(uid, msg)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
-        list(ex.map(send_morning, all_ids))
+        list(ex.map(send_morning, active_ids))
 
-    return jsonify({'status': 'ok', 'pushed': len(all_ids)})
+    return jsonify({'status': 'ok', 'pushed': len(active_ids)})
 
 
 @app.route('/api/night', methods=['GET'])
@@ -600,21 +593,15 @@ def night_cron():
 
     today    = get_logical_date()
     tomorrow = (datetime.strptime(today, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+    active_ids  = get_active_user_ids()
+    regular_ids = [uid for uid in active_ids if uid not in ADMIN_USER_IDS]
 
-    try:
-        regular_ids = [uid for uid in get_active_user_ids() if uid not in ADMIN_USER_IDS]
-        today_bulk    = get_all_date_tasks_bulk(today, regular_ids)    if regular_ids else {}
-        tomorrow_bulk = get_all_date_tasks_bulk(tomorrow, regular_ids) if regular_ids else {}
-    except Exception:
-        regular_ids   = []
-        today_bulk    = {}
-        tomorrow_bulk = {}
-
-    all_ids = list(ADMIN_USER_IDS) + regular_ids
+    today_bulk    = get_all_date_tasks_bulk(today, regular_ids)    if regular_ids else {}
+    tomorrow_bulk = get_all_date_tasks_bulk(tomorrow, regular_ids) if regular_ids else {}
 
     # Pre-fetch Notion data for admin users
-    notion_today    = {uid: get_tasks_for_date_notion(today)    for uid in ADMIN_USER_IDS}
-    notion_tomorrow = {uid: get_tasks_for_date_notion(tomorrow) for uid in ADMIN_USER_IDS}
+    notion_today    = {uid: get_tasks_for_date_notion(today)    for uid in active_ids if uid in ADMIN_USER_IDS}
+    notion_tomorrow = {uid: get_tasks_for_date_notion(tomorrow) for uid in active_ids if uid in ADMIN_USER_IDS}
 
     def send_night(uid):
         if uid in ADMIN_USER_IDS:
@@ -645,9 +632,9 @@ def night_cron():
         push_to_line(uid, f'晚安！🌙 今天辛苦了。\n\n{today_line}\n\n{tomorrow_section}')
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
-        list(ex.map(send_night, all_ids))
+        list(ex.map(send_night, active_ids))
 
-    return jsonify({'status': 'ok', 'pushed': len(all_ids)})
+    return jsonify({'status': 'ok', 'pushed': len(active_ids)})
 
 
 @app.route('/api/cleanup', methods=['GET'])
@@ -691,14 +678,9 @@ def lunch_cron():
     if CRON_SECRET and auth != f'Bearer {CRON_SECRET}':
         abort(401)
 
-    try:
-        regular_ids = [uid for uid in get_active_user_ids() if uid not in ADMIN_USER_IDS]
-        all_tasks   = get_all_today_tasks_bulk(regular_ids) if regular_ids else {}
-    except Exception:
-        regular_ids = []
-        all_tasks   = {}
-
-    all_ids = list(ADMIN_USER_IDS) + regular_ids
+    active_ids  = get_active_user_ids()
+    regular_ids = [uid for uid in active_ids if uid not in ADMIN_USER_IDS]
+    all_tasks   = get_all_today_tasks_bulk(regular_ids) if regular_ids else {}
 
     def send_lunch(uid):
         tasks = get_today_tasks_notion() if uid in ADMIN_USER_IDS else all_tasks.get(uid, [])
@@ -709,9 +691,9 @@ def lunch_cron():
         push_to_line(uid, f'📲 午休提醒 — 還有 {len(tasks)} 件待辦：\n\n{lines}{more}\n\n趁午休處理幾件？')
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
-        list(ex.map(send_lunch, all_ids))
+        list(ex.map(send_lunch, active_ids))
 
-    return jsonify({'status': 'ok', 'pushed': len(all_ids)})
+    return jsonify({'status': 'ok', 'pushed': len(active_ids)})
 
 
 @app.route('/api/admin/stats', methods=['GET'])
