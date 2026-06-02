@@ -10,6 +10,7 @@ import httpx
 import gspread
 from google.oauth2.service_account import Credentials
 from groq import Groq
+from notion_client import Client as NotionClient
 
 app = Flask(__name__)
 
@@ -20,12 +21,102 @@ GROQ_API_KEY              = os.environ.get('GROQ_API_KEY', '')
 SPREADSHEET_ID            = os.environ.get('SPREADSHEET_ID', '')
 SERVICE_ACCOUNT_JSON      = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '{}')
 ADMIN_USER_IDS            = set(os.environ.get('ADMIN_USER_IDS', '').split(',')) - {''}
+NOTION_TOKEN              = os.environ.get('NOTION_TOKEN', '')
+NOTION_TASK_DB_ID         = os.environ.get('NOTION_TASK_DB_ID', '55830834dfe647a8bb6d931660e9ae22')
 
 MAX_USERS = 10
+INACTIVITY_DAYS = int(os.environ.get('INACTIVITY_DAYS', '7'))
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 TW_TZ = timezone(timedelta(hours=8))
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+
+
+# ── Notion helpers ────────────────────────────────────────────────────────────
+
+def _notion():
+    return NotionClient(auth=NOTION_TOKEN)
+
+
+def _notion_page_name(page) -> str:
+    arr = page['properties'].get('Name', {}).get('title', [])
+    return ''.join([t.get('plain_text', '') for t in arr]) or '(無名稱)'
+
+
+def get_today_tasks_notion() -> list:
+    today = get_logical_date()
+    resp = _notion().databases.query(
+        database_id=NOTION_TASK_DB_ID,
+        filter={"and": [
+            {"property": "Date", "date": {"equals": today}},
+            {"property": "Status", "checkbox": {"equals": False}},
+        ]},
+        sorts=[{"property": "Date", "direction": "ascending"}],
+    )
+    return [{'row': p['id'], 'name': _notion_page_name(p)} for p in resp['results']]
+
+
+def get_upcoming_tasks_notion() -> dict:
+    today = get_logical_date()
+    resp = _notion().databases.query(
+        database_id=NOTION_TASK_DB_ID,
+        filter={"and": [
+            {"property": "Date", "date": {"on_or_after": today}},
+            {"property": "Status", "checkbox": {"equals": False}},
+        ]},
+        sorts=[{"property": "Date", "direction": "ascending"}],
+    )
+    grouped = {}
+    for p in resp['results']:
+        date_obj = p['properties'].get('Date', {}).get('date')
+        date = date_obj.get('start', '')[:10] if date_obj else ''
+        if date:
+            grouped.setdefault(date, []).append(_notion_page_name(p))
+    return dict(sorted(grouped.items()))
+
+
+def get_tasks_for_date_notion(date: str) -> dict:
+    resp = _notion().databases.query(
+        database_id=NOTION_TASK_DB_ID,
+        filter={"property": "Date", "date": {"equals": date}},
+    )
+    done, not_done = [], []
+    for p in resp['results']:
+        name = _notion_page_name(p)
+        checked = p['properties'].get('Status', {}).get('checkbox', False)
+        (done if checked else not_done).append(name)
+    return {'done': done, 'not_done': not_done}
+
+
+def mark_task_done_notion(page_id: str) -> bool:
+    try:
+        _notion().pages.update(page_id=page_id, properties={"Status": {"checkbox": True}})
+        return True
+    except Exception:
+        return False
+
+
+def delete_task_notion(page_id: str) -> bool:
+    try:
+        _notion().pages.update(page_id=page_id, archived=True)
+        return True
+    except Exception:
+        return False
+
+
+def add_task_notion(name: str, date: str = None) -> bool:
+    try:
+        _notion().pages.create(
+            parent={"database_id": NOTION_TASK_DB_ID},
+            properties={
+                "Name": {"title": [{"text": {"content": name}}]},
+                "Date": {"date": {"start": date or get_logical_date()}},
+                "Status": {"checkbox": False},
+            },
+        )
+        return True
+    except Exception:
+        return False
 
 
 def _gspread_client():
@@ -85,6 +176,61 @@ def get_active_user_ids() -> list:
 def get_waitlist_count() -> int:
     rows = get_users_sheet().get_all_records()
     return sum(1 for r in rows if str(r.get('候補', '')).upper() == 'TRUE')
+
+
+def update_last_active(user_id: str):
+    sheet = get_users_sheet()
+    rows = sheet.get_all_records()
+    now_str = datetime.now(TW_TZ).strftime('%Y-%m-%d %H:%M')
+    for i, row in enumerate(rows, start=2):
+        if str(row.get('user_id', '')) == user_id:
+            sheet.update_cell(i, 4, now_str)
+            return
+
+
+def get_stale_active_users(days: int) -> list:
+    sheet = get_users_sheet()
+    rows = sheet.get_all_records()
+    threshold = datetime.now(TW_TZ) - timedelta(days=days)
+    stale = []
+    for row in rows:
+        if str(row.get('候補', '')).upper() == 'TRUE':
+            continue
+        uid = str(row.get('user_id', ''))
+        if not uid or uid in ADMIN_USER_IDS:
+            continue
+        last = str(row.get('last_active', '') or row.get('加入時間', ''))
+        if not last:
+            continue
+        try:
+            last_dt = datetime.strptime(last[:16], '%Y-%m-%d %H:%M').replace(tzinfo=TW_TZ)
+            if last_dt < threshold:
+                stale.append(uid)
+        except ValueError:
+            pass
+    return stale
+
+
+def move_to_waitlist(user_id: str):
+    sheet = get_users_sheet()
+    rows = sheet.get_all_records()
+    for i, row in enumerate(rows, start=2):
+        if str(row.get('user_id', '')) == user_id:
+            sheet.update_cell(i, 3, 'TRUE')
+            return
+
+
+def promote_first_waitlist() -> str | None:
+    sheet = get_users_sheet()
+    rows = sheet.get_all_records()
+    for i, row in enumerate(rows, start=2):
+        if str(row.get('候補', '')).upper() == 'TRUE':
+            uid = str(row.get('user_id', ''))
+            now_str = datetime.now(TW_TZ).strftime('%Y-%m-%d %H:%M')
+            sheet.update_cell(i, 3, 'FALSE')
+            sheet.update_cell(i, 4, now_str)
+            return uid
+    return None
 
 
 # ── Task operations ───────────────────────────────────────────────────────────
@@ -239,6 +385,34 @@ def push_to_line(user_id: str, message: str):
     )
 
 
+def _register_and_reply(user_id: str, reply_token: str):
+    result = register_user(user_id)
+    if result == 'registered':
+        active = len(get_active_user_ids())
+        remaining = MAX_USERS - active
+        spots_line = f'名額還剩 {remaining} 個' if remaining > 0 else '你搶到最後一個名額'
+        reply_to_line(reply_token,
+            f'嗨！我是 Aria 👋 你的 LINE 任務小幫手\n\n'
+            f'你是第 {active} 位 Beta 成員，{spots_line} 🎉\n\n'
+            f'直接跟我說話就好，例如：\n\n'
+            f'📋 「今天有什麼事？」\n'
+            f'➕ 「幫我記：明天要繳費」\n'
+            f'➕ 「5/9 21:00 打匹克球」（支援時間和日期）\n'
+            f'✅ 「週報做完了」\n'
+            f'🗑️ 「刪除：打匹克球」\n'
+            f'📌 「我這週有什麼事？」\n\n'
+            f'有什麼想記的，直接說就好 😊\n\n'
+            f'📌 使用須知：你的任務資料會儲存於管理者的 Google Sheet，僅供本服務使用。\n'
+            f'⏰ 提醒：{INACTIVITY_DAYS} 天內未使用，名額會自動釋出給候補用戶。')
+    elif result == 'waitlist':
+        waitlist = get_waitlist_count()
+        reply_to_line(reply_token,
+            f'感謝你的興趣！Beta {MAX_USERS} 個名額已全數額滿 😔\n\n'
+            f'目前候補人數：{waitlist} 人\n\n'
+            f'已幫你登記候補，有空缺時會第一時間通知你！\n'
+            f'在此之前，歡迎追蹤 IG @leohsu625 了解更多 ✨')
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.route('/api/webhook', methods=['POST'])
@@ -250,12 +424,19 @@ def webhook():
         abort(400)
 
     for event in json.loads(body).get('events', []):
-        if event.get('type') != 'message' or event['message'].get('type') != 'text':
+        event_type  = event.get('type')
+        reply_token = event.get('replyToken', '')
+        user_id     = event.get('source', {}).get('userId', '')
+
+        if event_type == 'follow':
+            if user_id:
+                _register_and_reply(user_id, reply_token)
+            continue
+
+        if event_type != 'message' or event['message'].get('type') != 'text':
             continue
 
         user_message = event['message']['text'].strip()
-        reply_token  = event['replyToken']
-        user_id      = event.get('source', {}).get('userId', '')
 
         if user_message == '/myid':
             reply_to_line(reply_token, f'你的 LINE User ID：\n{user_id}')
@@ -268,28 +449,7 @@ def webhook():
             status = get_user_status(user_id)
 
         if status == 'new':
-            result = register_user(user_id)
-            if result == 'registered':
-                active = len(get_active_user_ids())
-                reply_to_line(reply_token,
-                    f'嗨！我是 Aria 👋 你的 LINE 任務小幫手\n\n'
-                    f'你是第 {active} 位 Beta 成員，名額還剩 {MAX_USERS - active} 個 🎉\n\n'
-                    f'直接跟我說話就好，例如：\n\n'
-                    f'📋 「今天有什麼事？」\n'
-                    f'➕ 「幫我記：明天要繳費」\n'
-                    f'➕ 「5/9 21:00 打匹克球」（支援時間和日期）\n'
-                    f'✅ 「週報做完了」\n'
-                    f'🗑️ 「刪除：打匹克球」\n'
-                    f'📌 「我這週有什麼事？」\n\n'
-                    f'有什麼想記的，直接說就好 😊\n\n'
-                    f'📌 使用須知：你的任務資料會儲存於管理者的 Google Sheet，僅供本服務使用。')
-            else:
-                waitlist = get_waitlist_count()
-                reply_to_line(reply_token,
-                    f'感謝你的興趣！Beta 20 個名額已全數額滿 😔\n\n'
-                    f'目前候補人數：{waitlist} 人\n\n'
-                    f'已幫你登記候補，有空缺時會第一時間通知你！\n'
-                    f'在此之前，歡迎追蹤 IG @leohsu625 了解更多 ✨')
+            _register_and_reply(user_id, reply_token)
             continue
 
         if status == 'waitlist':
@@ -299,8 +459,9 @@ def webhook():
             continue
 
         # ── Active user: normal flow ──
+        is_admin = user_id in ADMIN_USER_IDS
         try:
-            tasks  = get_today_tasks(user_id)
+            tasks  = get_today_tasks_notion() if is_admin else get_today_tasks(user_id)
             result = ask_groq(user_message, tasks)
             action = result.get('action')
             reply_text = result.get('reply', '收到！')
@@ -313,7 +474,7 @@ def webhook():
                     lines += [f'・{t["name"]}' for t in tasks]
                     reply_text = '\n'.join(lines)
             elif action == 'query_upcoming':
-                upcoming = get_upcoming_tasks(user_id)
+                upcoming = get_upcoming_tasks_notion() if is_admin else get_upcoming_tasks(user_id)
                 if not upcoming:
                     reply_text = '目前沒有任何未完成的任務安排 🎉'
                 else:
@@ -325,7 +486,7 @@ def webhook():
             elif action == 'query_date':
                 date = result.get('date', '')
                 if date:
-                    dt = get_tasks_for_date(date, user_id)
+                    dt = get_tasks_for_date_notion(date) if is_admin else get_tasks_for_date(date, user_id)
                     not_done, done = dt['not_done'], dt['done']
                     if not not_done and not done:
                         reply_text = f'{date} 沒有任何任務紀錄。'
@@ -341,8 +502,10 @@ def webhook():
             elif action == 'mark_done':
                 row = result.get('row')
                 if row:
-                    if mark_task_done(int(row)):
-                        task_name = next((t['name'] for t in tasks if t['row'] == int(row)), None)
+                    ok = mark_task_done_notion(row) if is_admin else mark_task_done(int(row))
+                    if ok:
+                        match_row = row if is_admin else int(row)
+                        task_name = next((t['name'] for t in tasks if t['row'] == match_row), None)
                         if task_name:
                             reply_text = f'✅ 已完成：{task_name}\n\n如果標錯了，請告訴我！'
                     else:
@@ -350,15 +513,19 @@ def webhook():
             elif action == 'delete_task':
                 row = result.get('row')
                 if row:
-                    task_name = next((t['name'] for t in tasks if t['row'] == int(row)), None)
-                    if delete_task(int(row)):
+                    match_row = row if is_admin else int(row)
+                    task_name = next((t['name'] for t in tasks if t['row'] == match_row), None)
+                    ok = delete_task_notion(row) if is_admin else delete_task(int(row))
+                    if ok:
                         reply_text = f'🗑️ 已刪除：{task_name or "任務"}'
                     else:
                         reply_text = '刪除失敗，請稍後再試 🙏'
             elif action == 'add_task':
                 task_name = result.get('task_name', '')
-                if task_name and not add_task(task_name, user_id, result.get('date')):
-                    reply_text = '新增失敗，請稍後再試 🙏'
+                if task_name:
+                    ok = add_task_notion(task_name, result.get('date')) if is_admin else add_task(task_name, user_id, result.get('date'))
+                    if not ok:
+                        reply_text = '新增失敗，請稍後再試 🙏'
             elif action == 'add_tasks':
                 succeeded = []
                 failed = []
@@ -367,7 +534,8 @@ def webhook():
                     if not task_name:
                         continue
                     date_val = t.get('date')
-                    if add_task(task_name, user_id, date_val):
+                    ok = add_task_notion(task_name, date_val) if is_admin else add_task(task_name, user_id, date_val)
+                    if ok:
                         label = f'{date_val} {task_name}' if date_val else task_name
                         succeeded.append(label)
                     else:
@@ -384,6 +552,10 @@ def webhook():
             reply_text = '抱歉，剛才沒有反應過來 😅 可以再說一次，或換個方式試試？'
 
         reply_to_line(reply_token, reply_text)
+        try:
+            update_last_active(user_id)
+        except Exception:
+            pass
 
     return jsonify({'status': 'ok'})
 
@@ -399,7 +571,7 @@ def cron():
     all_tasks   = get_all_today_tasks_bulk(active_ids)  # single sheet read
 
     def send_morning(uid):
-        tasks = all_tasks.get(uid, [])
+        tasks = get_today_tasks_notion() if uid in ADMIN_USER_IDS else all_tasks.get(uid, [])
         if not tasks:
             msg = f'早安！☀️\n{today} 今天沒有待辦，有需要新增嗎？'
         else:
@@ -421,13 +593,24 @@ def night_cron():
 
     today    = get_logical_date()
     tomorrow = (datetime.strptime(today, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
-    active_ids = get_active_user_ids()
+    active_ids  = get_active_user_ids()
+    regular_ids = [uid for uid in active_ids if uid not in ADMIN_USER_IDS]
 
-    today_bulk    = get_all_date_tasks_bulk(today, active_ids)
-    tomorrow_bulk = get_all_date_tasks_bulk(tomorrow, active_ids)
+    today_bulk    = get_all_date_tasks_bulk(today, regular_ids)    if regular_ids else {}
+    tomorrow_bulk = get_all_date_tasks_bulk(tomorrow, regular_ids) if regular_ids else {}
+
+    # Pre-fetch Notion data for admin users
+    notion_today    = {uid: get_tasks_for_date_notion(today)    for uid in active_ids if uid in ADMIN_USER_IDS}
+    notion_tomorrow = {uid: get_tasks_for_date_notion(tomorrow) for uid in active_ids if uid in ADMIN_USER_IDS}
 
     def send_night(uid):
-        t = today_bulk[uid]
+        if uid in ADMIN_USER_IDS:
+            t        = notion_today[uid]
+            tm_tasks = notion_tomorrow[uid]['not_done']
+        else:
+            t        = today_bulk[uid]
+            tm_tasks = tomorrow_bulk[uid]['not_done']
+
         done_count  = len(t['done'])
         total_count = done_count + len(t['not_done'])
 
@@ -440,10 +623,9 @@ def night_cron():
         else:
             today_line = '今日沒有任務紀錄'
 
-        tm = tomorrow_bulk[uid]
-        if tm['not_done']:
-            lines = '\n'.join([f'• {x}' for x in tm['not_done']])
-            tomorrow_section = f'明日預覽（{len(tm["not_done"])} 件）：\n{lines}'
+        if tm_tasks:
+            lines = '\n'.join([f'• {x}' for x in tm_tasks])
+            tomorrow_section = f'明日預覽（{len(tm_tasks)} 件）：\n{lines}'
         else:
             tomorrow_section = '明天還沒有任務規劃，記得安排一下！'
 
@@ -451,6 +633,65 @@ def night_cron():
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
         list(ex.map(send_night, active_ids))
+
+    return jsonify({'status': 'ok', 'pushed': len(active_ids)})
+
+
+@app.route('/api/cleanup', methods=['GET'])
+def cleanup_cron():
+    auth = request.headers.get('Authorization', '')
+    if CRON_SECRET and auth != f'Bearer {CRON_SECRET}':
+        abort(401)
+
+    stale = get_stale_active_users(INACTIVITY_DAYS)
+    deactivated, promoted = 0, 0
+
+    for uid in stale:
+        move_to_waitlist(uid)
+        deactivated += 1
+        push_to_line(uid,
+            f'嗨！你已經 {INACTIVITY_DAYS} 天沒有使用 Aria，\n'
+            f'名額已暫時釋出給候補的用戶。\n\n'
+            f'想繼續使用的話，直接傳訊息給我，\n'
+            f'有空缺時會主動通知你 🙏')
+
+        new_uid = promote_first_waitlist()
+        if new_uid:
+            promoted += 1
+            active_count = len(get_active_user_ids())
+            push_to_line(new_uid,
+                f'好消息！剛才有名額釋出，\n'
+                f'你已從候補升格為正式成員 🎉\n\n'
+                f'你是第 {active_count} 位 Beta 成員！\n\n'
+                f'直接跟我說話就好，例如：\n\n'
+                f'📋 「今天有什麼事？」\n'
+                f'➕ 「幫我記：明天要繳費」\n'
+                f'✅ 「週報做完了」\n\n'
+                f'有什麼想記的，直接說就好 😊')
+
+    return jsonify({'status': 'ok', 'deactivated': deactivated, 'promoted': promoted})
+
+
+@app.route('/api/lunch', methods=['GET'])
+def lunch_cron():
+    auth = request.headers.get('Authorization', '')
+    if CRON_SECRET and auth != f'Bearer {CRON_SECRET}':
+        abort(401)
+
+    active_ids  = get_active_user_ids()
+    regular_ids = [uid for uid in active_ids if uid not in ADMIN_USER_IDS]
+    all_tasks   = get_all_today_tasks_bulk(regular_ids) if regular_ids else {}
+
+    def send_lunch(uid):
+        tasks = get_today_tasks_notion() if uid in ADMIN_USER_IDS else all_tasks.get(uid, [])
+        if not tasks:
+            return
+        lines = '\n'.join([f'• {t["name"]}' for t in tasks[:5]])
+        more  = f'\n...還有 {len(tasks) - 5} 件' if len(tasks) > 5 else ''
+        push_to_line(uid, f'📲 午休提醒 — 還有 {len(tasks)} 件待辦：\n\n{lines}{more}\n\n趁午休處理幾件？')
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+        list(ex.map(send_lunch, active_ids))
 
     return jsonify({'status': 'ok', 'pushed': len(active_ids)})
 

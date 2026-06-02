@@ -17,8 +17,16 @@
       "schedule": "0 1 * * *"
     },
     {
+      "path": "/api/lunch",
+      "schedule": "30 4 * * *"
+    },
+    {
       "path": "/api/night",
       "schedule": "0 14 * * *"
+    },
+    {
+      "path": "/api/cleanup",
+      "schedule": "0 16 * * *"
     }
   ]
 }
