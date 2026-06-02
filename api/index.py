@@ -10,7 +10,6 @@ import httpx
 import gspread
 from google.oauth2.service_account import Credentials
 from groq import Groq
-from notion_client import Client as NotionClient
 
 app = Flask(__name__)
 
@@ -55,8 +54,23 @@ def get_logical_date() -> str:
 
 # ── Notion helpers ────────────────────────────────────────────────────────────
 
-def _notion():
-    return NotionClient(auth=NOTION_TOKEN)
+def _notion_headers() -> dict:
+    return {
+        'Authorization': f'Bearer {NOTION_TOKEN}',
+        'Notion-Version': '2022-06-28',
+        'Content-Type': 'application/json',
+    }
+
+
+def _notion_query(body: dict) -> list:
+    resp = httpx.post(
+        f'https://api.notion.com/v1/databases/{NOTION_TASK_DB_ID}/query',
+        headers=_notion_headers(),
+        json=body,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json()['results']
 
 
 def _notion_page_name(page) -> str:
@@ -66,30 +80,28 @@ def _notion_page_name(page) -> str:
 
 def get_today_tasks_notion() -> list:
     today = get_logical_date()
-    results = _notion().databases.query(
-        database_id=NOTION_TASK_DB_ID,
-        filter={
+    results = _notion_query({
+        'filter': {
             'and': [
                 {'property': 'Date', 'date': {'equals': today}},
                 {'property': 'Status', 'checkbox': {'equals': False}},
             ]
         }
-    )['results']
+    })
     return [{'id': p['id'], 'name': _notion_page_name(p)} for p in results]
 
 
 def get_upcoming_tasks_notion() -> dict:
     today = get_logical_date()
-    results = _notion().databases.query(
-        database_id=NOTION_TASK_DB_ID,
-        filter={
+    results = _notion_query({
+        'filter': {
             'and': [
                 {'property': 'Date', 'date': {'on_or_after': today}},
                 {'property': 'Status', 'checkbox': {'equals': False}},
             ]
         },
-        sorts=[{'property': 'Date', 'direction': 'ascending'}]
-    )['results']
+        'sorts': [{'property': 'Date', 'direction': 'ascending'}]
+    })
     grouped = {}
     for p in results:
         date = (p['properties'].get('Date', {}).get('date') or {}).get('start', '')
@@ -99,10 +111,7 @@ def get_upcoming_tasks_notion() -> dict:
 
 
 def get_tasks_for_date_notion(date: str) -> dict:
-    results = _notion().databases.query(
-        database_id=NOTION_TASK_DB_ID,
-        filter={'property': 'Date', 'date': {'equals': date}}
-    )['results']
+    results = _notion_query({'filter': {'property': 'Date', 'date': {'equals': date}}})
     done, not_done = [], []
     for p in results:
         name = _notion_page_name(p)
@@ -115,7 +124,13 @@ def get_tasks_for_date_notion(date: str) -> dict:
 
 def mark_task_done_notion(page_id: str) -> bool:
     try:
-        _notion().pages.update(page_id=page_id, properties={'Status': {'checkbox': True}})
+        resp = httpx.patch(
+            f'https://api.notion.com/v1/pages/{page_id}',
+            headers=_notion_headers(),
+            json={'properties': {'Status': {'checkbox': True}}},
+            timeout=10,
+        )
+        resp.raise_for_status()
         return True
     except Exception:
         return False
@@ -123,7 +138,13 @@ def mark_task_done_notion(page_id: str) -> bool:
 
 def delete_task_notion(page_id: str) -> bool:
     try:
-        _notion().pages.update(page_id=page_id, archived=True)
+        resp = httpx.patch(
+            f'https://api.notion.com/v1/pages/{page_id}',
+            headers=_notion_headers(),
+            json={'archived': True},
+            timeout=10,
+        )
+        resp.raise_for_status()
         return True
     except Exception:
         return False
@@ -134,7 +155,13 @@ def add_task_notion(name: str, date: str = None) -> bool:
         props = {'Name': {'title': [{'text': {'content': name}}]}}
         if date:
             props['Date'] = {'date': {'start': date}}
-        _notion().pages.create(parent={'database_id': NOTION_TASK_DB_ID}, properties=props)
+        resp = httpx.post(
+            'https://api.notion.com/v1/pages',
+            headers=_notion_headers(),
+            json={'parent': {'database_id': NOTION_TASK_DB_ID}, 'properties': props},
+            timeout=10,
+        )
+        resp.raise_for_status()
         return True
     except Exception:
         return False
