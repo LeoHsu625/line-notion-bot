@@ -650,10 +650,6 @@ def webhook():
 
 @app.route('/api/cron', methods=['GET'])
 def cron():
-    auth = request.headers.get('Authorization', '')
-    if CRON_SECRET and auth != f'Bearer {CRON_SECRET}':
-        abort(401)
-
     today = get_logical_date()
 
     # Admin users: fetch from Notion
@@ -694,10 +690,6 @@ def cron():
 
 @app.route('/api/lunch', methods=['GET'])
 def lunch_cron():
-    auth = request.headers.get('Authorization', '')
-    if CRON_SECRET and auth != f'Bearer {CRON_SECRET}':
-        abort(401)
-
     today = get_logical_date()
 
     # Admin users: fetch from Notion
@@ -738,10 +730,6 @@ def lunch_cron():
 
 @app.route('/api/night', methods=['GET'])
 def night_cron():
-    auth = request.headers.get('Authorization', '')
-    if CRON_SECRET and auth != f'Bearer {CRON_SECRET}':
-        abort(401)
-
     today    = get_logical_date()
     tomorrow = (datetime.strptime(today, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
 
