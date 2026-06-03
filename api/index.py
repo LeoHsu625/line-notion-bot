@@ -10,6 +10,7 @@ import httpx
 import gspread
 from google.oauth2.service_account import Credentials
 from groq import Groq
+from upstash_redis import Redis
 
 app = Flask(__name__)
 
@@ -22,12 +23,50 @@ SERVICE_ACCOUNT_JSON      = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '{}')
 ADMIN_USER_IDS            = set(os.environ.get('ADMIN_USER_IDS', '').split(',')) - {''}
 NOTION_TOKEN              = os.environ.get('NOTION_TOKEN', '')
 NOTION_TASK_DB_ID         = os.environ.get('NOTION_TASK_DB_ID', '55830834dfe647a8bb6d931660e9ae22')
+UPSTASH_REDIS_REST_URL    = os.environ.get('UPSTASH_REDIS_REST_URL', '')
+UPSTASH_REDIS_REST_TOKEN  = os.environ.get('UPSTASH_REDIS_REST_TOKEN', '')
 
 MAX_USERS = 10
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 TW_TZ = timezone(timedelta(hours=8))
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+
+
+# ── Session memory (Upstash Redis) ───────────────────────────────────────────
+# Key:   session:{line_user_id}
+# TTL:   86400s（24h 後自動清空，每天對話記憶重置）
+# Shape: {
+#   "last_tasks": [{"row": 1, "name": "任務名稱", "_id": "notion-page-id"}],
+#   "history":    [{"role": "user"|"assistant", "content": "..."}]  ← 最多 12 筆（6 輪）
+# }
+# last_tasks：最近展示給用戶的任務清單（含 Notion page_id），
+#             讓 delete/mark_done 在 today 沒有任務時仍能找到正確的 Notion 頁面
+# history：傳給 Groq 的對話紀錄，解決「把那個刪掉」等需要前後文的模糊指令
+
+_redis_instance = None
+
+def _get_redis():
+    global _redis_instance
+    if _redis_instance is None and UPSTASH_REDIS_REST_URL:
+        _redis_instance = Redis(url=UPSTASH_REDIS_REST_URL, token=UPSTASH_REDIS_REST_TOKEN)
+    return _redis_instance
+
+def load_session(user_id: str) -> dict:
+    try:
+        r = _get_redis()
+        data = r.get(f'session:{user_id}') if r else None
+        return json.loads(data) if data else {'last_tasks': [], 'history': []}
+    except Exception:
+        return {'last_tasks': [], 'history': []}
+
+def save_session(user_id: str, session: dict):
+    try:
+        r = _get_redis()
+        if r:
+            r.setex(f'session:{user_id}', 86400, json.dumps(session, ensure_ascii=False))
+    except Exception:
+        pass
 
 
 def _gspread_client():
@@ -292,7 +331,7 @@ def add_task(name: str, user_id: str, date: str = None) -> bool:
 
 # ── AI ────────────────────────────────────────────────────────────────────────
 
-def ask_groq(user_message: str, tasks: list) -> dict:
+def ask_groq(user_message: str, tasks: list, history: list = None) -> dict:
     today = get_logical_date()
     task_list_str = (
         '\n'.join([f'- [ROW:{t["row"]}] {t["name"]}' for t in tasks])
@@ -318,17 +357,19 @@ def ask_groq(user_message: str, tasks: list) -> dict:
 - 全部用繁體中文回覆
 - 用戶詢問特定日期（非今天）時使用 query_date，date 填入該日期
 - 用戶一次提到多個任務時，使用 add_tasks
-- 標記完成時，從清單找最相符的任務並填入 ROW 數字
+- 標記完成或刪除時，從任務清單找最相符的任務並填入 ROW 數字；若對話紀錄中有提過任務清單，也可參考前文找到正確的 ROW
 - 找不到對應任務時用 action: reply 告知
 - 如果用戶在任務中指定時間，請將時間保留在 task_name 中（例如：task_name 為「21:00 打匹克球」）"""
+
+    messages = [{'role': 'system', 'content': system_prompt}]
+    if history:
+        messages.extend(history[-12:])  # 最多帶入最近 6 輪對話
+    messages.append({'role': 'user', 'content': user_message})
 
     resp = groq_client.chat.completions.create(
         model='llama-3.3-70b-versatile',
         max_tokens=500,
-        messages=[
-            {'role': 'system', 'content': system_prompt},
-            {'role': 'user', 'content': user_message},
-        ],
+        messages=messages,
     )
     text = resp.choices[0].message.content.strip()
     if '{' in text:
@@ -418,21 +459,25 @@ def webhook():
 
         # ── Admin: Notion flow ──
         if is_admin:
+            session = load_session(user_id)
             try:
                 notion_tasks = get_today_tasks_notion()
-                tasks = [{'row': i + 1, 'name': t['name'], '_id': t['id']}
-                         for i, t in enumerate(notion_tasks)]
-                result = ask_groq(user_message, tasks)
+                today_tasks = [{'row': i + 1, 'name': t['name'], '_id': t['id']}
+                               for i, t in enumerate(notion_tasks)]
+                # 今天有任務就用今天的，否則用 session 快取（例如昨晚提醒後隔天還沒刷新）
+                context_tasks = today_tasks if today_tasks else session.get('last_tasks', [])
+                result = ask_groq(user_message, context_tasks, session.get('history', []))
                 action = result.get('action')
                 reply_text = result.get('reply', '收到！')
 
                 if action == 'query_tasks':
-                    if not tasks:
+                    if not today_tasks:
                         reply_text = '今天沒有待辦事項 🎉'
                     else:
-                        lines = [f'📋 今天有 {len(tasks)} 件待辦：\n']
-                        lines += [f'・{t["name"]}' for t in tasks]
+                        lines = [f'📋 今天有 {len(today_tasks)} 件待辦：\n']
+                        lines += [f'・{t["name"]}' for t in today_tasks]
                         reply_text = '\n'.join(lines)
+                    session['last_tasks'] = today_tasks
                 elif action == 'query_upcoming':
                     upcoming = get_upcoming_tasks_notion()
                     if not upcoming:
@@ -462,9 +507,9 @@ def webhook():
                 elif action == 'mark_done':
                     row = result.get('row')
                     if row:
-                        page_id = next((t['_id'] for t in tasks if t['row'] == int(row)), None)
+                        page_id = next((t['_id'] for t in context_tasks if t['row'] == int(row)), None)
+                        task_name = next((t['name'] for t in context_tasks if t['row'] == int(row)), None)
                         if page_id and mark_task_done_notion(page_id):
-                            task_name = next((t['name'] for t in tasks if t['row'] == int(row)), None)
                             if task_name:
                                 reply_text = f'✅ 已完成：{task_name}\n\n如果標錯了，請告訴我！'
                         else:
@@ -472,8 +517,8 @@ def webhook():
                 elif action == 'delete_task':
                     row = result.get('row')
                     if row:
-                        page_id = next((t['_id'] for t in tasks if t['row'] == int(row)), None)
-                        task_name = next((t['name'] for t in tasks if t['row'] == int(row)), None)
+                        page_id = next((t['_id'] for t in context_tasks if t['row'] == int(row)), None)
+                        task_name = next((t['name'] for t in context_tasks if t['row'] == int(row)), None)
                         if page_id and delete_task_notion(page_id):
                             reply_text = f'🗑️ 已刪除：{task_name or "任務"}'
                         else:
@@ -503,6 +548,13 @@ def webhook():
                         reply_text = f'部分任務新增失敗：{", ".join(failed)} 🙏'
             except Exception:
                 reply_text = '抱歉，剛才沒有反應過來 😅 可以再說一次，或換個方式試試？'
+
+            history = session.get('history', [])
+            history.append({'role': 'user', 'content': user_message})
+            history.append({'role': 'assistant', 'content': reply_text})
+            session['history'] = history[-12:]
+            save_session(user_id, session)
+
             reply_to_line(reply_token, reply_text)
             continue
 
