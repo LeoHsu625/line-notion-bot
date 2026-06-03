@@ -28,6 +28,7 @@ UPSTASH_REDIS_REST_URL    = os.environ.get('UPSTASH_REDIS_REST_URL', '')
 UPSTASH_REDIS_REST_TOKEN  = os.environ.get('UPSTASH_REDIS_REST_TOKEN', '')
 AI_PROVIDER               = os.environ.get('AI_PROVIDER', 'groq')  # 'groq' or 'claude'
 ANTHROPIC_API_KEY         = os.environ.get('ANTHROPIC_API_KEY', '')
+PERSONAL_MODE             = os.environ.get('PERSONAL_MODE', '').lower() == 'true'  # 許小榮: True，Aria: False
 
 MAX_USERS = 10
 
@@ -440,16 +441,22 @@ def webhook():
             reply_to_line(reply_token, f'你的 LINE User ID：\n{user_id}')
             continue
 
-        # ── Admin bypass ──
-        is_admin = user_id in ADMIN_USER_IDS
-        if is_admin:
+        # ── 路由判斷 ──
+        # PERSONAL_MODE（許小榮）：所有訊息直走 Notion，不做用戶管理
+        # 一般模式（Aria）：區分 admin / 一般用戶，用 Google Sheets
+        if PERSONAL_MODE:
+            is_admin = True
             status = 'active'
         else:
-            try:
-                status = get_user_status(user_id)
-            except Exception:
-                reply_to_line(reply_token, '服務暫時不可用，請稍後再試 🙏')
-                continue
+            is_admin = user_id in ADMIN_USER_IDS
+            if is_admin:
+                status = 'active'
+            else:
+                try:
+                    status = get_user_status(user_id)
+                except Exception:
+                    reply_to_line(reply_token, '服務暫時不可用，請稍後再試 🙏')
+                    continue
 
         if status == 'new':
             try:
