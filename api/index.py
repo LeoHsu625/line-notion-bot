@@ -10,6 +10,7 @@ import httpx
 import gspread
 from google.oauth2.service_account import Credentials
 from groq import Groq
+import anthropic
 from upstash_redis import Redis
 
 app = Flask(__name__)
@@ -25,10 +26,19 @@ NOTION_TOKEN              = os.environ.get('NOTION_TOKEN', '')
 NOTION_TASK_DB_ID         = os.environ.get('NOTION_TASK_DB_ID', '55830834dfe647a8bb6d931660e9ae22')
 UPSTASH_REDIS_REST_URL    = os.environ.get('UPSTASH_REDIS_REST_URL', '')
 UPSTASH_REDIS_REST_TOKEN  = os.environ.get('UPSTASH_REDIS_REST_TOKEN', '')
+AI_PROVIDER               = os.environ.get('AI_PROVIDER', 'groq')  # 'groq' or 'claude'
+ANTHROPIC_API_KEY         = os.environ.get('ANTHROPIC_API_KEY', '')
 
 MAX_USERS = 10
 
 groq_client = Groq(api_key=GROQ_API_KEY)
+_anthropic_client = None
+
+def _get_anthropic():
+    global _anthropic_client
+    if _anthropic_client is None and ANTHROPIC_API_KEY:
+        _anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    return _anthropic_client
 TW_TZ = timezone(timedelta(hours=8))
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 
@@ -331,7 +341,7 @@ def add_task(name: str, user_id: str, date: str = None) -> bool:
 
 # ── AI ────────────────────────────────────────────────────────────────────────
 
-def ask_groq(user_message: str, tasks: list, history: list = None) -> dict:
+def ask_ai(user_message: str, tasks: list, history: list = None) -> dict:
     today = get_logical_date()
     task_list_str = (
         '\n'.join([f'- [ROW:{t["row"]}] {t["name"]}' for t in tasks])
@@ -361,17 +371,28 @@ def ask_groq(user_message: str, tasks: list, history: list = None) -> dict:
 - 找不到對應任務時用 action: reply 告知
 - 如果用戶在任務中指定時間，請將時間保留在 task_name 中（例如：task_name 為「21:00 打匹克球」）"""
 
-    messages = [{'role': 'system', 'content': system_prompt}]
+    ai_messages = []
     if history:
-        messages.extend(history[-12:])  # 最多帶入最近 6 輪對話
-    messages.append({'role': 'user', 'content': user_message})
+        ai_messages.extend(history[-12:])
+    ai_messages.append({'role': 'user', 'content': user_message})
 
-    resp = groq_client.chat.completions.create(
-        model='llama-3.3-70b-versatile',
-        max_tokens=500,
-        messages=messages,
-    )
-    text = resp.choices[0].message.content.strip()
+    if AI_PROVIDER == 'claude':
+        resp = _get_anthropic().messages.create(
+            model='claude-haiku-4-5-20251001',
+            max_tokens=500,
+            system=system_prompt,
+            messages=ai_messages,
+        )
+        text = resp.content[0].text.strip()
+    else:
+        groq_msgs = [{'role': 'system', 'content': system_prompt}] + ai_messages
+        resp = groq_client.chat.completions.create(
+            model='llama-3.3-70b-versatile',
+            max_tokens=500,
+            messages=groq_msgs,
+        )
+        text = resp.choices[0].message.content.strip()
+
     if '{' in text:
         text = text[text.index('{'):text.rindex('}') + 1]
     return json.loads(text)
@@ -424,31 +445,38 @@ def webhook():
         if is_admin:
             status = 'active'
         else:
-            status = get_user_status(user_id)
+            try:
+                status = get_user_status(user_id)
+            except Exception:
+                reply_to_line(reply_token, '服務暫時不可用，請稍後再試 🙏')
+                continue
 
         if status == 'new':
-            result = register_user(user_id)
-            if result == 'registered':
-                active = len(get_active_user_ids())
-                reply_to_line(reply_token,
-                    f'嗨！我是 Aria 👋 你的 LINE 任務小幫手\n\n'
-                    f'你是第 {active} 位 Beta 成員，名額還剩 {MAX_USERS - active} 個 🎉\n\n'
-                    f'直接跟我說話就好，例如：\n\n'
-                    f'📋 「今天有什麼事？」\n'
-                    f'➕ 「幫我記：明天要繳費」\n'
-                    f'➕ 「5/9 21:00 打匹克球」（支援時間和日期）\n'
-                    f'✅ 「週報做完了」\n'
-                    f'🗑️ 「刪除：打匹克球」\n'
-                    f'📌 「我這週有什麼事？」\n\n'
-                    f'有什麼想記的，直接說就好 😊\n\n'
-                    f'📌 使用須知：你的任務資料會儲存於管理者的 Google Sheet，僅供本服務使用。')
-            else:
-                waitlist = get_waitlist_count()
-                reply_to_line(reply_token,
-                    f'感謝你的興趣！Beta 20 個名額已全數額滿 😔\n\n'
-                    f'目前候補人數：{waitlist} 人\n\n'
-                    f'已幫你登記候補，有空缺時會第一時間通知你！\n'
-                    f'在此之前，歡迎追蹤 IG @leohsu625 了解更多 ✨')
+            try:
+                result = register_user(user_id)
+                if result == 'registered':
+                    active = len(get_active_user_ids())
+                    reply_to_line(reply_token,
+                        f'嗨！我是 Aria 👋 你的 LINE 任務小幫手\n\n'
+                        f'你是第 {active} 位 Beta 成員，名額還剩 {MAX_USERS - active} 個 🎉\n\n'
+                        f'直接跟我說話就好，例如：\n\n'
+                        f'📋 「今天有什麼事？」\n'
+                        f'➕ 「幫我記：明天要繳費」\n'
+                        f'➕ 「5/9 21:00 打匹克球」（支援時間和日期）\n'
+                        f'✅ 「週報做完了」\n'
+                        f'🗑️ 「刪除：打匹克球」\n'
+                        f'📌 「我這週有什麼事？」\n\n'
+                        f'有什麼想記的，直接說就好 😊\n\n'
+                        f'📌 使用須知：你的任務資料會儲存於管理者的 Google Sheet，僅供本服務使用。')
+                else:
+                    waitlist = get_waitlist_count()
+                    reply_to_line(reply_token,
+                        f'感謝你的興趣！Beta 20 個名額已全數額滿 😔\n\n'
+                        f'目前候補人數：{waitlist} 人\n\n'
+                        f'已幫你登記候補，有空缺時會第一時間通知你！\n'
+                        f'在此之前，歡迎追蹤 IG @leohsu625 了解更多 ✨')
+            except Exception:
+                reply_to_line(reply_token, '服務暫時不可用，請稍後再試 🙏')
             continue
 
         if status == 'waitlist':
@@ -466,7 +494,7 @@ def webhook():
                                for i, t in enumerate(notion_tasks)]
                 # 今天有任務就用今天的，否則用 session 快取（例如昨晚提醒後隔天還沒刷新）
                 context_tasks = today_tasks if today_tasks else session.get('last_tasks', [])
-                result = ask_groq(user_message, context_tasks, session.get('history', []))
+                result = ask_ai(user_message, context_tasks, session.get('history', []))
                 action = result.get('action')
                 reply_text = result.get('reply', '收到！')
 
@@ -561,7 +589,7 @@ def webhook():
         # ── Active user: normal flow ──
         try:
             tasks  = get_today_tasks(user_id)
-            result = ask_groq(user_message, tasks)
+            result = ask_ai(user_message, tasks)
             action = result.get('action')
             reply_text = result.get('reply', '收到！')
 
