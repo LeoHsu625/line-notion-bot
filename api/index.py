@@ -485,8 +485,8 @@ def webhook():
                 f'歡迎追蹤 IG @leohsu625 了解最新動態')
             continue
 
-        # ── Admin: Notion flow ──
-        if is_admin:
+        # ── Admin: Notion flow（只有設了 NOTION_TOKEN 才走這條，否則落回 Google Sheets）──
+        if is_admin and NOTION_TOKEN:
             session = load_session(user_id)
             try:
                 notion_tasks = get_today_tasks_notion()
